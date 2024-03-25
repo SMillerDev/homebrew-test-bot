@@ -3,7 +3,7 @@
 module Homebrew
   module Tests
     class PackagesDetect < Test
-      attr_reader :testing_formulae, :added_formulae, :deleted_formulae, 
+      attr_reader :testing_formulae, :added_formulae, :deleted_formulae,
                   :testing_casks, :added_casks, :deleted_casks
 
       def initialize(argument, tap:, git:, dry_run:, fail_fast:, verbose:)
@@ -60,6 +60,15 @@ module Homebrew
           end
 
           @testing_formulae = [canonical_formula_name]
+          @testing_casks = []
+        elsif (canonical_cask_name = safe_cask_canonical_name(@argument, args:))
+          unless canonical_cask_name.include?("/")
+            ENV["HOMEBREW_NO_INSTALL_FROM_API"] = "1"
+            CoreTap.ensure_installed!
+          end
+
+          @testing_casks = [canonical_cask_name]
+          @testing_formulae = []
         else
           raise UsageError,
                 "#{@argument} is not detected from GitHub Actions or a formula name!"
@@ -139,20 +148,14 @@ module Homebrew
 
         if tap && diff_start_sha1 != diff_end_sha1
           formula_path = tap.formula_dir.to_s
-          @added_formulae +=
-            diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "A")
-          modified_formulae +=
-            diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "M")
-          @deleted_formulae +=
-            diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "D")
+          @added_formulae += diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "A")
+          modified_formulae += diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "M")
+          @deleted_formulae += diff_packages(diff_start_sha1, diff_end_sha1, formula_path, "D")
 
           cask_path = tap.cask_dir.to_s
-          @added_casks += @added_formulae +
-                             diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "A")
-          modified_casks += modified_formulae +
-                               diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "M")
-          @deleted_casks += @deleted_formulae +
-                               diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "D")
+          @added_casks += diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "A")
+          modified_casks += diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "M")
+          @deleted_casks += diff_packages(diff_start_sha1, diff_end_sha1, cask_path, "D")
         end
 
         # If a package is both added and deleted: it's actually modified.
@@ -169,7 +172,6 @@ module Homebrew
         if args.test_default_formula?
           # Build the default test formula.
           modified_formulae << "homebrew/test-bot/testbottest"
-          modified_casks << "homebrew/test-bot/testbottest"
         end
 
         @testing_formulae += @added_formulae + modified_formulae
@@ -189,6 +191,7 @@ module Homebrew
         @added_formulae.uniq!
         modified_formulae.uniq!
         @deleted_formulae.uniq!
+
         @testing_casks.uniq!
         @added_casks.uniq!
         modified_casks.uniq!
@@ -214,19 +217,24 @@ module Homebrew
           end
         end
 
-        puts <<-EOS
+        if args.only_casks_detect?
+          puts <<-EOS
 
-    testing_formulae  #{@testing_formulae.join(" ").presence  || "(none)"}
-    added_formulae    #{@added_formulae.join(" ").presence    || "(none)"}
-    modified_formulae #{modified_formulae.join(" ").presence  || "(none)"}
-    deleted_formulae  #{@deleted_formulae.join(" ").presence  || "(none)"}
-    formulae_to_fetch #{@formulae_to_fetch.join(" ").presence || "(none)"}
+          testing_casks  #{@testing_casks.join(" ").presence  || "(none)"}
+          added_casks    #{@added_casks.join(" ").presence    || "(none)"}
+          modified_casks #{modified_casks.join(" ").presence  || "(none)"}
+          deleted_casks  #{@deleted_casks.join(" ").presence  || "(none)"}
+          EOS
+        else
+          puts <<-EOS
 
-    testing_casks  #{@testing_casks.join(" ").presence  || "(none)"}
-    added_casks    #{@added_casks.join(" ").presence    || "(none)"}
-    modified_casks #{modified_casks.join(" ").presence  || "(none)"}
-    deleted_casks  #{@deleted_casks.join(" ").presence  || "(none)"}
-        EOS
+      testing_formulae  #{@testing_formulae.join(" ").presence  || "(none)"}
+      added_formulae    #{@added_formulae.join(" ").presence    || "(none)"}
+      modified_formulae #{modified_formulae.join(" ").presence  || "(none)"}
+      deleted_formulae  #{@deleted_formulae.join(" ").presence  || "(none)"}
+      formulae_to_fetch #{@formulae_to_fetch.join(" ").presence || "(none)"}
+          EOS
+        end
       end
 
       def safe_formula_canonical_name(formula_name, args:)
@@ -242,6 +250,22 @@ module Homebrew
         puts e.backtrace if args.debug?
       rescue FormulaUnavailableError, TapFormulaAmbiguityError,
              TapFormulaWithOldnameAmbiguityError => e
+        onoe e
+        puts e.backtrace if args.debug?
+      end
+
+      def safe_cask_canonical_name(cask_name, args:)
+        Homebrew.with_no_api_env do
+          CaskLoader.load(cask_name).full_name
+        end
+      rescue TapCaskUnavailableError => e
+        raise if e.tap.installed?
+
+        test "brew", "tap", e.tap.name
+        retry unless steps.last.failed?
+        onoe e
+        puts e.backtrace if args.debug?
+      rescue CaskUnavailableError, TapCaskAmbiguityError => e
         onoe e
         puts e.backtrace if args.debug?
       end
@@ -264,14 +288,11 @@ module Homebrew
         ).lines.filter_map do |line|
           file = Pathname.new line.chomp
 
-          name = nil
           if tap.formula_file?(file)
-            name = tap.formula_file_to_name(file)
+            tap.formula_file_to_name(file)
           elsif tap.cask_file?(file)
-            name = file.basename(".rb").to_s
+            file.basename(".rb").to_s
           end
-
-          name
         end.compact
       end
     end
